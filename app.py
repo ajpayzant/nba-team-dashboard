@@ -409,10 +409,10 @@ def player_dashboard():
 
         col_r1, col_r2 = st.columns([1,1])
         with col_r1:
-            if st.button("🔄 Refresh metrics (safe)"):
+            if st.button("Refresh metrics"):
                 st.session_state["team_ctx_refresh_key"] = st.session_state.get("team_ctx_refresh_key", 0) + 1
         with col_r2:
-            if st.button("🧹 Hard clear cache"):
+            if st.button("Hard clear cache"):
                 st.cache_data.clear()
                 st.session_state["team_ctx_refresh_key"] = st.session_state.get("team_ctx_refresh_key", 0) + 1
 
