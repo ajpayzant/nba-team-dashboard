@@ -622,185 +622,241 @@ def player_dashboard():
 
     # Projections (unchanged behavior)
     with st.expander("Player Projection Summary"):
-        st.caption("Blend of Recent/Season/Prev Season/Career and (if available) vs-Opponent, with defense & pace adjustments, scaled to projected minutes. Confidence bands use robust stats + minutes volatility.")
-        try:
-            cc1, cc2, cc3 = st.columns(3)
-            with cc1:
-                recent_sel = st.session_state.get("recent_sel", "Season")
-                recent_n = 10 if recent_sel == "Season" else int(recent_sel)
-                w_recent  = st.slider("Weight: Recent", 0.00, 0.80, 0.45, 0.05)
-            with cc2:
-                w_season  = st.slider("Weight: Current Season", 0.00, 0.80, 0.25, 0.05)
-                w_prev    = st.slider("Weight: Prev Season", 0.00, 0.50, 0.10, 0.05)
-            with cc3:
-                w_career  = st.slider("Weight: Career", 0.00, 0.50, 0.10, 0.05)
-                w_vsopp   = st.slider("Weight: vs Opponent", 0.00, 0.50, 0.10, 0.05)
+    st.markdown(
+        """
+        #### How this projection works
+        This model blends multiple sources on a per-game basis—**Recent**, **Current Season**, **Previous Season**, **Career**, and (if available) **vs. Opponent**—then applies **defense** and **pace** adjustments for the selected opponent.  
+        - Use the **weights** (0.00–1.00 each). We’ll **normalize** your inputs to sum to 1.00 automatically.  
+        - Adjust **Projected MIN** to see projections scale accordingly.  
+        - Toggle the **Confidence Band** and choose **90% / 80% / 70%** intervals to see uncertainty bounds.
+        """
+    )
 
-            cc4, cc5, cc6 = st.columns(3)
-            with cc4:
-                z_level = st.selectbox("CI Level", ["90%", "80%","70%"], index=0)
-                z_map = {"70%":1.04, "80%":1.28, "90%":1.64}
-                z = z_map[z_level]
-            with cc5:
-                rel_cap = st.slider("Max ±% from point (cap)", 0.10, 0.40, 0.25, 0.05)
-            with cc6:
-                alpha_min_vol = st.slider("Minutes volatility sensitivity", 0.0, 1.0, 0.5, 0.05)
+    try:
+        # --- Weight sliders: all on 0..1 scale, normalized later ---
+        wc1, wc2, wc3, wc4, wc5 = st.columns(5)
+        with wc1:
+            w_recent_in = st.slider("Recent (0–1)", 0.00, 1.00, 0.45, 0.05, help="Last N games (see Recency window above)")
+        with wc2:
+            w_season_in = st.slider("Season (0–1)", 0.00, 1.00, 0.25, 0.05, help="Current season per-game")
+        with wc3:
+            w_prev_in   = st.slider("Prev (0–1)",   0.00, 1.00, 0.10, 0.05, help="Previous season per-game")
+        with wc4:
+            w_career_in = st.slider("Career (0–1)", 0.00, 1.00, 0.10, 0.05, help="Career per-game average")
+        with wc5:
+            w_vsopp_in  = st.slider("Vs Opp (0–1)", 0.00, 1.00, 0.10, 0.05, help="Last 5 vs this opponent (if available)")
 
-            METRICS = ["PTS","REB","AST","FG3M","MIN"]
+        # --- Confidence & model knobs ---
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            z_level = st.selectbox("Confidence Interval", ["90%", "80%", "70%"], index=0)
+            z_map = {"70%": 1.04, "80%": 1.28, "90%": 1.64}
+            z = z_map[z_level]
+        with cc2:
+            rel_cap = st.slider("CI cap (±%)", 0.10, 0.40, 0.25, 0.05, help="Limits CI spread to a % around the point estimate")
+        with cc3:
+            alpha_min_vol = st.slider("Minutes volatility sensitivity", 0.0, 1.0, 0.5, 0.05, help="Higher widens CI when minutes vary")
+
+        # --- Build sources (unchanged logic) ---
+        METRICS = ["PTS", "REB", "AST", "FG3M", "MIN"]
+        for c in METRICS:
+            if c not in logs.columns:
+                logs[c] = 0
+
+        recent_sel = st.session_state.get("recent_sel", "Season")
+        recent_n = 10 if recent_sel == "Season" else int(recent_sel)
+
+        src = {}
+        src["recent"] = logs[METRICS].head(recent_n).mean(numeric_only=True)
+        src["season"] = logs[METRICS].mean(numeric_only=True)
+
+        prev_label = _prev_season_label(season)
+        prev_logs_local = get_player_logs(player_id, prev_label)
+        for c in METRICS:
+            if c not in prev_logs_local.columns:
+                prev_logs_local[c] = 0
+        src["prev"] = (
+            prev_logs_local[METRICS].mean(numeric_only=True)
+            if not prev_logs_local.empty else pd.Series({m: np.nan for m in METRICS})
+        )
+
+        def _career_pg_fast(cdf, cols):
+            if cdf.empty or "GP" not in cdf.columns:
+                return pd.Series({k: np.nan for k in cols})
+            tot_gp = pd.to_numeric(cdf["GP"], errors="coerce").sum()
+            if tot_gp == 0:
+                return pd.Series({k: np.nan for k in cols})
+            out = {k: pd.to_numeric(cdf.get(k, 0), errors="coerce").sum() / tot_gp for k in cols}
+            return pd.Series(out)
+
+        src["career"] = _career_pg_fast(career_df, METRICS)
+
+        if 'vs_opp_df' in locals() and not vs_opp_df.empty:
+            tmp = vs_opp_df.copy()
             for c in METRICS:
-                if c not in logs.columns:
-                    logs[c] = 0
+                if c not in tmp.columns: tmp[c] = 0
+            src["vsopp"] = tmp.sort_values("GAME_DATE", ascending=False).head(5)[METRICS].mean(numeric_only=True)
+        else:
+            src["vsopp"] = pd.Series({m: np.nan for m in METRICS})
 
-            src = {}
-            src["recent"] = logs[METRICS].head(recent_n).mean(numeric_only=True)
-            src["season"] = logs[METRICS].mean(numeric_only=True)
+        # --- Normalize weights (handles any 0..1 inputs) ---
+        raw_weights = {
+            "recent": w_recent_in,
+            "season": w_season_in,
+            "prev":   w_prev_in,
+            "career": w_career_in,
+            "vsopp":  w_vsopp_in
+        }
+        # Keep sources that have at least some non-NaN values
+        valid_sources = {k: v for k, v in src.items() if v.notna().any()}
+        # If all sliders are zero, default to recent=1
+        total_raw = sum(raw_weights[k] for k in valid_sources.keys()) if valid_sources else 0.0
+        if total_raw <= 0:
+            norm_w = {k: (1.0 if k == "recent" else 0.0) for k in valid_sources.keys()}
+        else:
+            norm_w = {k: raw_weights[k] / total_raw for k in valid_sources.keys()}
 
-            prev_label = _prev_season_label(season)
-            prev_logs_local = get_player_logs(player_id, prev_label)
-            for c in METRICS:
-                if c not in prev_logs_local.columns:
-                    prev_logs_local[c] = 0
-            src["prev"] = prev_logs_local[METRICS].mean(numeric_only=True) if not prev_logs_local.empty else pd.Series({m: np.nan for m in METRICS})
+        if not valid_sources:
+            st.info("Not enough data to generate a projection.")
+            raise RuntimeError("No projection sources")
 
-            def _career_pg_fast(cdf, cols):
-                if cdf.empty or "GP" not in cdf.columns: return pd.Series({k: np.nan for k in cols})
-                tot_gp = pd.to_numeric(cdf["GP"], errors="coerce").sum()
-                if tot_gp == 0: return pd.Series({k: np.nan for k in cols})
-                out = {k: pd.to_numeric(cdf.get(k, 0), errors="coerce").sum() / tot_gp for k in cols}
-                return pd.Series(out)
-            src["career"] = _career_pg_fast(career_df, METRICS)
+        # --- Blended baseline ---
+        blend = sum(norm_w[k] * valid_sources[k] for k in valid_sources.keys())
+        blend = blend.reindex(METRICS)
 
-            if 'vs_opp_df' in locals() and not vs_opp_df.empty:
-                tmp = vs_opp_df.copy()
-                for c in METRICS:
-                    if c not in tmp.columns: tmp[c] = 0
-                src["vsopp"] = tmp.sort_values("GAME_DATE", ascending=False).head(5)[METRICS].mean(numeric_only=True)
-            else:
-                src["vsopp"] = pd.Series({m: np.nan for m in METRICS})
+        # --- Opponent / pace adjustments on per-minute rates ---
+        eps = 1e-9
+        per_min = {}
+        for m in ["PTS", "REB", "AST", "FG3M"]:
+            per_min[m] = (blend[m] / max(blend["MIN"], eps)) if pd.notna(blend[m]) and pd.notna(blend["MIN"]) and blend["MIN"] > 0 else np.nan
+        per_min = pd.Series(per_min)
 
-            weights = {"recent": w_recent, "season": w_season, "prev": w_prev, "career": w_career, "vsopp": w_vsopp}
-            valid_sources = {k: v for k, v in src.items() if v.notna().any()}
-            if not valid_sources:
-                st.info("Not enough data to generate a projection.")
-                raise RuntimeError("No projection sources")
-            total_w = sum(weights[k] for k in valid_sources.keys())
-            if total_w <= 0:
-                st.info("All weights are zero—adjust sliders to enable projection.")
-                raise RuntimeError("Zero total weight")
-            norm_w = {k: weights[k] / total_w for k in valid_sources.keys()}
+        league_def = team_ctx["DEF_RATING"].mean()
+        opp_def   = opp_row.get("DEF_RATING", np.nan)
+        def_factor = float(league_def) / float(opp_def) if pd.notna(league_def) and pd.notna(opp_def) and opp_def > 0 else 1.0
+        def_factor = float(np.clip(def_factor, 0.90, 1.10))  # tighter
+        league_pace = team_ctx["PACE"].mean()
+        opp_pace    = opp_row.get("PACE", np.nan)
+        pace_factor = float(opp_pace) / float(league_pace) if pd.notna(league_pace) and pd.notna(opp_pace) and league_pace > 0 else 1.0
+        pace_factor = float(np.sqrt(np.clip(pace_factor, 0.90, 1.10)))  # gentler
+        adj_rate = per_min * def_factor * pace_factor
 
-            blend = sum(norm_w[k] * valid_sources[k] for k in valid_sources.keys())
-            blend = blend.reindex(METRICS)
+        # --- Projected minutes (user override) ---
+        min_recent = valid_sources.get("recent", pd.Series()).get("MIN", np.nan)
+        min_season = valid_sources.get("season", pd.Series()).get("MIN", np.nan)
+        if pd.isna(min_recent) and pd.isna(min_season):
+            min_proj_seed = blend["MIN"] if pd.notna(blend["MIN"]) else 30.0
+        elif pd.isna(min_recent):
+            min_proj_seed = float(min_season)
+        elif pd.isna(min_season):
+            min_proj_seed = float(min_recent)
+        else:
+            min_proj_seed = 0.65 * float(min_recent) + 0.35 * float(min_season)
+        min_proj_seed = float(np.clip(min_proj_seed if pd.notna(min_proj_seed) else 30.0, 10.0, 42.0))
 
-            eps = 1e-9
-            per_min = {}
-            for m in ["PTS","REB","AST","FG3M"]:
-                per_min[m] = (blend[m] / max(blend["MIN"], eps)) if pd.notna(blend[m]) and pd.notna(blend["MIN"]) and blend["MIN"] > 0 else np.nan
-            per_min = pd.Series(per_min)
+        min_proj = st.number_input("Projected MIN (editable)", min_value=5.0, max_value=48.0, value=float(min_proj_seed), step=0.5,
+                                   help="Adjust minutes to scale PTS/REB/AST/3PM and PRA outputs")
 
-            league_def = team_ctx["DEF_RATING"].mean()
-            opp_def   = opp_row.get("DEF_RATING", np.nan)
-            def_factor = float(league_def) / float(opp_def) if pd.notna(league_def) and pd.notna(opp_def) and opp_def > 0 else 1.0
-            def_factor = float(np.clip(def_factor, 0.90, 1.10))
-            league_pace = team_ctx["PACE"].mean()
-            opp_pace    = opp_row.get("PACE", np.nan)
-            pace_factor = float(opp_pace) / float(league_pace) if pd.notna(league_pace) and pd.notna(opp_pace) and league_pace > 0 else 1.0
-            pace_factor = float(np.sqrt(np.clip(pace_factor, 0.90, 1.10)))
-            adj_rate = per_min * def_factor * pace_factor
+        # --- Final projection counts ---
+        proj = pd.Series(index=["PTS", "REB", "AST", "FG3M", "MIN"], dtype=float)
+        for m in ["PTS", "REB", "AST", "FG3M"]:
+            proj[m] = float(adj_rate.get(m, np.nan) * min_proj) if pd.notna(adj_rate.get(m, np.nan)) else np.nan
+        proj["MIN"] = float(min_proj)
+        proj["PRA"] = (proj["PTS"] if pd.notna(proj["PTS"]) else 0) + \
+                      (proj["REB"] if pd.notna(proj["REB"]) else 0) + \
+                      (proj["AST"] if pd.notna(proj["AST"]) else 0)
 
-            min_recent = valid_sources.get("recent", pd.Series()).get("MIN", np.nan)
-            min_season = valid_sources.get("season", pd.Series()).get("MIN", np.nan)
-            if pd.isna(min_recent) and pd.isna(min_season):
-                min_proj = blend["MIN"] if pd.notna(blend["MIN"]) else 30.0
-            elif pd.isna(min_recent):
-                min_proj = float(min_season)
-            elif pd.isna(min_season):
-                min_proj = float(min_recent)
-            else:
-                min_proj = 0.65 * float(min_recent) + 0.35 * float(min_season)
-            min_proj = float(np.clip(min_proj if pd.notna(min_proj) else 30.0, 10.0, 42.0))
-            min_override = st.number_input("Projected MIN (override if needed)", min_value=5.0, max_value=48.0, value=float(min_proj), step=0.5)
-            min_proj = float(min_override)
+        # --- Confidence band (uses selected z from 90/80/70 exactly) ---
+        show_ci = st.checkbox("Show confidence band", value=True)
+        ci_df = None
+        if show_ci:
+            hist = logs.head(15).copy()
+            for c in ["PTS", "REB", "AST", "FG3M", "MIN"]:
+                if c not in hist.columns: hist[c] = 0
+            hist = hist[hist["MIN"] > 0]
+            if not hist.empty:
+                # Per-minute distributions
+                pm = pd.DataFrame({
+                    "PTS":  hist["PTS"]/hist["MIN"],
+                    "REB":  hist["REB"]/hist["MIN"],
+                    "AST":  hist["AST"]/hist["MIN"],
+                    "FG3M": hist["FG3M"]/hist["MIN"],
+                })
+                # Winsorize
+                q05 = pm.quantile(0.05, numeric_only=True)
+                q95 = pm.quantile(0.95, numeric_only=True)
+                pm = pm.clip(lower=q05, upper=q95, axis=1)
 
-            proj = pd.Series(index=["PTS","REB","AST","FG3M","MIN"], dtype=float)
-            for m in ["PTS","REB","AST","FG3M"]:
-                proj[m] = float(adj_rate.get(m, np.nan) * min_proj) if pd.notna(adj_rate.get(m, np.nan)) else np.nan
-            proj["MIN"] = min_proj
-            proj["PRA"] = (proj["PTS"] if pd.notna(proj["PTS"]) else 0) + \
-                          (proj["REB"] if pd.notna(proj["REB"]) else 0) + \
-                          (proj["AST"] if pd.notna(proj["AST"]) else 0)
+                # Robust SD via MAD
+                med = pm.median(numeric_only=True)
+                mad = (pm - med).abs().median(numeric_only=True)
+                robust_sd = 1.4826 * mad
+                fallback_sd = pm.std(numeric_only=True).fillna(0.0)
+                sd_pm = robust_sd.fillna(fallback_sd)
 
-            show_ci = st.checkbox("Show confidence band", value=True)
-            ci_df = None
-            if show_ci:
-                hist = logs.head(15).copy()
-                for c in ["PTS","REB","AST","FG3M","MIN"]:
-                    if c not in hist.columns: hist[c] = 0
-                hist = hist[hist["MIN"] > 0]
-                if not hist.empty:
-                    pm = pd.DataFrame({
-                        "PTS": hist["PTS"]/hist["MIN"],
-                        "REB": hist["REB"]/hist["MIN"],
-                        "AST": hist["AST"]/hist["MIN"],
-                        "FG3M": hist["FG3M"]/hist["MIN"],
-                    })
-                    q05 = pm.quantile(0.05, numeric_only=True)
-                    q95 = pm.quantile(0.95, numeric_only=True)
-                    pm = pm.clip(lower=q05, upper=q95, axis=1)
+                # Small-sample shrinkage
+                n = len(pm)
+                shrink_k = 10
+                sd_pm = sd_pm * (n / (n + shrink_k))
 
-                    med = pm.median(numeric_only=True)
-                    mad = (pm - med).abs().median(numeric_only=True)
-                    robust_sd = 1.4826 * mad
-                    fallback_sd = pm.std(numeric_only=True).fillna(0.0)
-                    sd_pm = robust_sd.fillna(fallback_sd)
+                # Minutes volatility multiplier
+                min_std  = float(hist["MIN"].std() or 0.0)
+                min_mean = float(hist["MIN"].mean() or 1.0)
+                vol_ratio = min_std / max(min_mean, 1.0)
+                ci_mult = 1.0 + alpha_min_vol * vol_ratio
 
-                    n = len(pm)
-                    shrink_k = 10
-                    shrink_factor = n / (n + shrink_k)
-                    sd_pm = sd_pm * shrink_factor
+                # Error per minute -> counts
+                err_pm = z * sd_pm                       # <-- z comes directly from selected CI (90/80/70)
+                err = err_pm * np.sqrt(max(min_proj, 1.0)) * ci_mult
 
-                    min_std = float(hist["MIN"].std() or 0.0)
-                    min_mean = float(hist["MIN"].mean() or 1.0)
-                    vol_ratio = min_std / max(min_mean, 1.0)
-                    ci_mult = 1.0 + alpha_min_vol * vol_ratio
+                base = proj[["PTS","REB","AST","FG3M"]]
+                rate_est = adj_rate[["PTS","REB","AST","FG3M"]]
+                lo_raw = (rate_est - err.clip(lower=0)) * min_proj
+                hi_raw = (rate_est + err.clip(lower=0)) * min_proj
 
-                    err_pm = z * sd_pm
-                    err = err_pm * np.sqrt(max(min_proj, 1.0)) * ci_mult
+                # Relative caps around point estimate
+                lo_cap = base * (1.0 - rel_cap)
+                hi_cap = base * (1.0 + rel_cap)
+                lo = pd.concat([lo_raw, lo_cap], axis=1).max(axis=1)
+                hi = pd.concat([hi_raw, hi_cap], axis=1).min(axis=1)
 
-                    base = proj[["PTS","REB","AST","FG3M"]]
-                    rate_est = adj_rate[["PTS","REB","AST","FG3M"]]
-                    lo_raw = (rate_est - err.clip(lower=0)) * min_proj
-                    hi_raw = (rate_est + err.clip(lower=0)) * min_proj
+                lo = np.minimum(lo, base)
+                hi = np.maximum(hi, base)
 
-                    lo_cap = base * (1.0 - rel_cap)
-                    hi_cap = base * (1.0 + rel_cap)
-                    lo = pd.concat([lo_raw, lo_cap], axis=1).max(axis=1)
-                    hi = pd.concat([hi_raw, hi_cap], axis=1).min(axis=1)
+                ci_df = pd.DataFrame({"Low": lo.round(2), "Proj": base.round(2), "High": hi.round(2)})
 
-                    lo = np.minimum(lo, base)
-                    hi = np.maximum(hi, base)
+        # --- Render outputs (with 3PM label) ---
+        out = proj[["MIN", "PTS", "REB", "AST", "PRA", "FG3M"]].to_frame("Projection").T.round(2)
+        out = out.rename(columns={"FG3M": "3PM"})
+        st.dataframe(out, use_container_width=True, height=90)
 
-                    ci_df = pd.DataFrame({"Low": lo.round(2), "Proj": base.round(2), "High": hi.round(2)})
+        # Show weight summary (normalized)
+        st.caption(
+            "Normalized blend weights → "
+            + ", ".join([f"{k.capitalize()}: {norm_w.get(k,0):.2f}" for k in ["recent","season","prev","career","vsopp"]])
+            + f" • CI: {z_level} • Defense adj: {def_factor:.3f} • Pace adj: {pace_factor:.3f}"
+        )
 
-            out = proj[["MIN","PTS","REB","AST","FG3M","PRA"]].to_frame("Projection").T.round(2)
-            st.dataframe(out, use_container_width=True, height=90)
+        if ci_df is not None and not ci_df.empty:
+            st.markdown("**Confidence Band (counts):**")
+            # Reorder rows to match our display order
+            ci_disp = ci_df.reindex(["PTS","REB","AST","FG3M"])
+            ci_disp = ci_disp.rename(index={"FG3M":"3PM"})
+            st.dataframe(ci_disp, use_container_width=True, height=170)
 
-            st.caption(
-                f"Adj factors → Defense: {def_factor:.3f}, Pace: {pace_factor:.3f}. "
-                f"Weights: Recent {norm_w.get('recent',0):.2f}, Season {norm_w.get('season',0):.2f}, "
-                f"Prev {norm_w.get('prev',0):.2f}, Career {norm_w.get('career',0):.2f}, VsOpp {norm_w.get('vsopp',0):.2f}."
-            )
+        st.markdown(
+            """
+            *Notes:*  
+            • Weights are **normalized** automatically—set any combination between 0 and 1.  
+            • If all weights are set to 0, the model defaults to **Recent = 1.00**.  
+            • **Projected MIN** scales all counting stats.  
+            • CI uses robust per-minute variance with minutes-volatility adjustment and a relative cap for stability.
+            """
+        )
 
-            if ci_df is not None and not ci_df.empty:
-                st.markdown("**Confidence Band (counts):**")
-                st.dataframe(ci_df, use_container_width=True, height=150)
+    except Exception as e:
+        st.info(f"Projection temporarily unavailable: {e}")
 
-        except Exception as e:
-            st.info(f"Projection temporarily unavailable: {e}")
-
-    st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). "
-               "MIN reflects totals from Base (Totals); PACE/ratings from Advanced (PerGame). "
-               "Opponent last-5 uses LeagueGameFinder with a robust fallback. Average rows are computed over the shown 5 games.")
 
 # ======================================================================
 # TEAM DASHBOARD (as previously provided and working)
