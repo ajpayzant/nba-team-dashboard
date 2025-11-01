@@ -1,8 +1,8 @@
-# app_team_roster.py — NBA Team Roster Dashboard (stacked tables; trimmed columns)
-# - Uses LeagueDashPlayerStats (PerGame) for Season, Last 5, Last 15
-# - Shows roster tables stacked vertically (easier to read)
-# - Exact columns & order per spec; computes FG2M/FG2A if needed
-# - Renames TEAM_ABBREVIATION -> TM and PLUS_MINUS -> +/- 
+# app_team_roster.py — NBA Team Roster Dashboard + Team Season Summary (ranks)
+# - Adds a top "Team Season Summary" with record + value and league rank (1/30 best)
+# - Traditional (PerGame): PTS, FG%, FGA, 3P%, 3PA, FT%, FTM, STL, BLK, TOV, +/-
+# - Advanced (PerGame): OFF_RATING, DEF_RATING, NET_RATING, PACE
+# - Three stacked player roster tables (Season / Last 5 / Last 15), same trimmed columns as before
 
 import time
 import datetime
@@ -12,7 +12,7 @@ import streamlit as st
 from zoneinfo import ZoneInfo
 
 from nba_api.stats.static import teams as static_teams
-from nba_api.stats.endpoints import LeagueDashPlayerStats
+from nba_api.stats.endpoints import LeagueDashPlayerStats, leaguedashteamstats
 
 # ----------------------- Streamlit Setup -----------------------
 st.set_page_config(page_title="NBA Team Roster Dashboard", layout="wide")
@@ -62,7 +62,7 @@ def merge_team_labels(df: pd.DataFrame) -> pd.DataFrame:
         df["TEAM_ABBREVIATION"] = df["TEAM_ID"].map(ABBR_BY_ID)
     return df
 
-# ----------------------- Data Fetch -----------------------
+# ----------------------- Data Fetch: Players -----------------------
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def fetch_players_per_game(season: str, last_n_games: int = 0) -> pd.DataFrame:
     """LeagueDashPlayerStats PerGame (whole league), optionally last_n_games."""
@@ -82,6 +82,39 @@ def fetch_players_per_game(season: str, last_n_games: int = 0) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return merge_team_labels(df)
 
+# ----------------------- Data Fetch: Teams (Traditional + Advanced) -----------------------
+@st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
+def fetch_team_trad_advanced(season: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    base_kwargs = dict(
+        season=season,
+        season_type_all_star="Regular Season",
+        league_id_nullable="00",
+        per_mode_detailed="PerGame",
+    )
+    # Traditional (PerGame)
+    trad = _retry_api(
+        leaguedashteamstats.LeagueDashTeamStats,
+        dict(base_kwargs, measure_type_detailed_defense="Base"),
+    )
+    trad = trad[0] if trad else pd.DataFrame()
+    trad = merge_team_labels(trad)
+
+    # Advanced (PerGame)
+    adv = _retry_api(
+        leaguedashteamstats.LeagueDashTeamStats,
+        dict(base_kwargs, measure_type_detailed_defense="Advanced"),
+    )
+    adv = adv[0] if adv else pd.DataFrame()
+    adv = merge_team_labels(adv)
+
+    # Coerce numerics
+    for df in (trad, adv):
+        for c in df.columns:
+            if c not in ("TEAM_ID","TEAM_NAME","TEAM_ABBREVIATION"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return trad, adv
+
 # ----------------------- Helpers -----------------------
 COL_ORDER = [
     "TM", "PLAYER_NAME", "AGE", "GP", "MIN", "PTS", "REB", "AST",
@@ -94,15 +127,10 @@ def _auto_height(df, row_px=34, header_px=38, max_px=900):
     return min(max_px, header_px + row_px * rows + 8)
 
 def _shape_roster_table(df: pd.DataFrame, team_id: int) -> pd.DataFrame:
-    """
-    Filter to team, compute FG2M/FG2A, rename columns, and select exact order.
-    """
     if df.empty:
         return df
     t = df.loc[df["TEAM_ID"] == team_id].copy()
 
-    # Compute FG2M / FG2A if not present
-    # LeagueDashPlayerStats columns typically include FGM, FGA, FG3M, FG3A
     if "FGM" in t.columns and "FG3M" in t.columns:
         t["FG2M"] = (t["FGM"] - t["FG3M"]).astype(float)
     else:
@@ -113,11 +141,9 @@ def _shape_roster_table(df: pd.DataFrame, team_id: int) -> pd.DataFrame:
     else:
         t["FG2A"] = np.nan
 
-    # Ensure AGE exists (LeagueDashPlayerStats typically provides AGE)
     if "AGE" not in t.columns:
         t["AGE"] = np.nan
 
-    # Rename TEAM_ABBREVIATION -> TM; PLUS_MINUS -> +/-
     if "TEAM_ABBREVIATION" in t.columns:
         t.rename(columns={"TEAM_ABBREVIATION": "TM"}, inplace=True)
     else:
@@ -129,13 +155,11 @@ def _shape_roster_table(df: pd.DataFrame, team_id: int) -> pd.DataFrame:
         else:
             t["+/-"] = np.nan
 
-    # Some required columns may not exist on some seasons; create if missing
     needed = set(COL_ORDER)
     for c in needed:
         if c not in t.columns:
             t[c] = np.nan
 
-    # Keep only requested columns, in order; sort by MIN desc
     out = t[COL_ORDER].sort_values("MIN", ascending=False).reset_index(drop=True)
     return out
 
@@ -162,9 +186,103 @@ if team_id is None:
     st.error("Could not resolve TEAM_ID for the selected team.")
     st.stop()
 
+# ----------------------- Team Season Summary (values + ranks) -----------------------
+st.header(team_name)
+
+try:
+    trad_df, adv_df = fetch_team_trad_advanced(season)
+    if trad_df.empty or adv_df.empty:
+        raise RuntimeError("Failed to load team Traditional and/or Advanced tables.")
+
+    # Merge Traditional + Advanced by TEAM_ID
+    merged = pd.merge(
+        trad_df[
+            ["TEAM_ID","TEAM_NAME","TEAM_ABBREVIATION","GP","W","L","W_PCT","PTS",
+             "FG_PCT","FGA","FG3_PCT","FG3A","FT_PCT","FTM","STL","BLK","TOV","PLUS_MINUS"]
+        ],
+        adv_df[["TEAM_ID","OFF_RATING","DEF_RATING","NET_RATING","PACE"]],
+        on="TEAM_ID",
+        how="inner"
+    )
+
+    team_row = merged.loc[merged["TEAM_ID"] == team_id].iloc[0]
+
+    # Build league ranks (1 is best). Specify ascending per metric.
+    metrics = {
+        "PTS": False,
+        "OFF_RATING": False,
+        "DEF_RATING": True,   # lower is better
+        "NET_RATING": False,
+        "PACE": False,
+        "FG_PCT": False,
+        "FGA": False,
+        "FG3_PCT": False,
+        "FG3A": False,
+        "FT_PCT": False,
+        "FTM": False,
+        "STL": False,
+        "BLK": False,
+        "TOV": True,          # lower is better
+        "PLUS_MINUS": False,
+    }
+
+    # Compute ranks on merged league table
+    ranks = {}
+    for m, asc in metrics.items():
+        ranks[m] = merged[m].rank(ascending=asc, method="min")
+
+    n_teams = len(merged.index)
+
+    def fmt_val(x, pct=False):
+        if pd.isna(x):
+            return "—"
+        return f"{x:.3f}" if pct else f"{x:.1f}"
+
+    def fmt_rank(r):
+        if pd.isna(r):
+            return "—"
+        return f"{int(r)}/{n_teams}"
+
+    record = f"{int(team_row['W'])}-{int(team_row['L'])}"
+
+    # Prepare a tidy summary table with Value + Rank
+    summary_rows = [
+        ("Record", record, "—"),
+        ("PTS", fmt_val(team_row["PTS"]), fmt_rank(ranks["PTS"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("NET Rating", fmt_val(team_row["NET_RATING"]), fmt_rank(ranks["NET_RATING"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("OFF Rating", fmt_val(team_row["OFF_RATING"]), fmt_rank(ranks["OFF_RATING"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("DEF Rating", fmt_val(team_row["DEF_RATING"]), fmt_rank(ranks["DEF_RATING"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("PACE", fmt_val(team_row["PACE"]), fmt_rank(ranks["PACE"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+
+        ("FG%", fmt_val(team_row["FG_PCT"], pct=True), fmt_rank(ranks["FG_PCT"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("FGA", fmt_val(team_row["FGA"]), fmt_rank(ranks["FGA"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+
+        ("3P%", fmt_val(team_row["FG3_PCT"], pct=True), fmt_rank(ranks["FG3_PCT"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("3PA", fmt_val(team_row["FG3A"]), fmt_rank(ranks["FG3A"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+
+        ("FT%", fmt_val(team_row["FT_PCT"], pct=True), fmt_rank(ranks["FT_PCT"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("FTM", fmt_val(team_row["FTM"]), fmt_rank(ranks["FTM"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+
+        ("STL", fmt_val(team_row["STL"]), fmt_rank(ranks["STL"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("BLK", fmt_val(team_row["BLK"]), fmt_rank(ranks["BLK"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("TOV", fmt_val(team_row["TOV"]), fmt_rank(ranks["TOV"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+        ("+/-", fmt_val(team_row["PLUS_MINUS"]), fmt_rank(ranks["PLUS_MINUS"].loc[merged["TEAM_ID"]==team_id].iloc[0])),
+    ]
+
+    summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value", "League Rank (1=best)"])
+
+    st.subheader("Team Season Summary")
+    st.dataframe(summary_df, use_container_width=True, height=_auto_height(summary_df))
+
+except Exception as e:
+    st.error(f"Unable to load Team Season Summary: {e}")
+
+st.caption(f"Season: **{season}** • Data source: LeagueDashTeamStats (PerGame, Regular Season)")
+
+# ----------------------- Roster Tables (stacked) -----------------------
+st.markdown("---")
 st.caption(f"TEAM: **{team_name}** — TEAM_ID: {team_id}")
 
-# ----------------------- Season / Last 5 / Last 15 (stacked) -----------------------
 # Season
 st.subheader("Season Per-Game (Roster)")
 try:
@@ -206,7 +324,8 @@ except Exception as e:
 
 st.divider()
 st.caption(
-    "Source: LeagueDashPlayerStats (PerGame, Regular Season). "
-    "Tables are stacked vertically and limited to the requested columns and order. "
-    "FG2M/FG2A are computed as (FGM−FG3M)/(FGA−FG3A) when not present."
+    "Notes: Team summary uses NBA.com Traditional & Advanced (PerGame). "
+    "League ranks treat lower DEF_RATING and TOV as better (1=best). "
+    "Roster tables use LeagueDashPlayerStats (PerGame, Regular Season). "
+    "FG2M/FG2A computed as (FGM−FG3M)/(FGA−FG3A) when not provided."
 )
