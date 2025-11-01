@@ -1,154 +1,154 @@
-import time
-import numpy as np
-import pandas as pd
+# app_basic_team.py
 import streamlit as st
+import pandas as pd
+from time import sleep
+from typing import Dict, Tuple
 
-# --- Harden nba_api HTTP so stats.nba.com behaves ---
-from nba_api.stats.library.http import NBAStatsHTTP
-NBAStatsHTTP.timeout = 30
-NBAStatsHTTP.headers = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://www.nba.com",
-    "Referer": "https://www.nba.com/",
-    "Connection": "keep-alive",
-    "Host": "stats.nba.com",
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
+# --- nba_api imports
+from nba_api.stats.static import teams as static_teams
+from nba_api.stats.endpoints import leaguedashteamstats
 
-from nba_api.stats.endpoints import LeagueDashTeamStats
-from nba_api.stats.static import teams as nba_static_teams
+st.set_page_config(page_title="NBA Team Basics — Season / Last 5 / Last 15", layout="wide")
 
-st.set_page_config(page_title="NBA Opponent Team Stats (Sanity Check)", layout="wide")
-st.title("NBA Opponent Team Stats — Per Game (Sanity Check)")
-st.caption("Goal: fetch and display the exact opponent-allowed per-game table that we’ll use in the main app.")
+# -----------------------
+# Helpers & cached fetch
+# -----------------------
+@st.cache_data(show_spinner=False, ttl=60*30)
+def get_team_index() -> Tuple[pd.DataFrame, Dict[int, str], Dict[int, str]]:
+    """
+    Returns:
+      teams_df: DataFrame with id, full_name, abbreviation
+      id_to_name: TEAM_ID -> full_name
+      id_to_abbr: TEAM_ID -> abbreviation
+    """
+    data = static_teams.get_teams()  # list of dicts
+    teams_df = pd.DataFrame(data)
+    teams_df = teams_df[["id", "full_name", "abbreviation"]].rename(
+        columns={"id": "TEAM_ID", "full_name": "TEAM_NAME", "abbreviation": "TEAM_ABBREVIATION"}
+    )
+    id_to_name = dict(teams_df[["TEAM_ID", "TEAM_NAME"]].values)
+    id_to_abbr = dict(teams_df[["TEAM_ID", "TEAM_ABBREVIATION"]].values)
+    return teams_df, id_to_name, id_to_abbr
 
-# ---------- Helpers ----------
-SEASONS = [f"{y}-{str(y+1)[-2:]}" for y in range(2018, 2026)]
-DEFAULT_SEASON = SEASONS[-1]
-
-def to_num(df: pd.DataFrame) -> pd.DataFrame:
+def _numeric(df: pd.DataFrame) -> pd.DataFrame:
+    # Make numeric if possible; keep TEAM columns as objects
     for c in df.columns:
-        if c in ("TEAM_NAME", "TEAM_ABBREVIATION"):
-            continue
+        if c not in ("TEAM_ID", "TEAM_NAME", "TEAM_ABBREVIATION"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+@st.cache_data(show_spinner=True, ttl=60*10)
+def fetch_league_dash(season: str, last_n_games: int = 0) -> pd.DataFrame:
+    """
+    Fetch Base/PerGame team stats for a season with optional last_n_games.
+    """
+    # Simple retry wrapper (stats API can time out occasionally)
+    for attempt in range(2):
         try:
-            df[c] = pd.to_numeric(df[c])
-        except Exception:
-            pass
-    return df
+            resp = leaguedashteamstats.LeagueDashTeamStats(
+                season=season,
+                measure_type_detailed_defense="Base",
+                per_mode_detailed="PerGame",
+                last_n_games=last_n_games,
+                timeout=30,
+            )
+            df = resp.get_data_frames()[0]
+            return _numeric(df.copy())
+        except Exception as e:
+            if attempt == 0:
+                sleep(1.0)
+            else:
+                raise e
 
-def derive_2p(df: pd.DataFrame, prefix: str = "") -> pd.DataFrame:
-    fgm, fga = f"{prefix}FGM" or "FGM", f"{prefix}FGA" or "FGA"
-    fg3m, fg3a = f"{prefix}FG3M" or "FG3M", f"{prefix}FG3A" or "FG3A"
-    p2m = f"{prefix}_2PM" if prefix else "_2PM"
-    p2a = f"{prefix}_2PA" if prefix else "_2PA"
-    if fgm in df.columns and fg3m in df.columns:
-        df[p2m] = df[fgm] - df[fg3m]
-    if fga in df.columns and fg3a in df.columns:
-        df[p2a] = df[fga] - df[fg3a]
-    return df
-
-def ensure_team_keys(df: pd.DataFrame) -> pd.DataFrame:
-    # Sometimes names are present but IDs aren’t; backfill from static map
+def merge_team_labels(df: pd.DataFrame, id_to_name: Dict[int, str], id_to_abbr: Dict[int, str]) -> pd.DataFrame:
+    """
+    Ensures TEAM_NAME/TEAM_ABBREVIATION exist by mapping from TEAM_ID if necessary.
+    """
     if "TEAM_ID" not in df.columns:
-        static = pd.DataFrame(nba_static_teams.get_teams())
-        df = df.merge(static[["id","full_name","abbreviation"]],
-                      left_on="TEAM_NAME", right_on="full_name", how="left")
-        df = df.rename(columns={"id":"TEAM_ID","abbreviation":"TEAM_ABBREVIATION"})
-        df.drop(columns=["full_name"], inplace=True, errors="ignore")
+        return df  # Unexpected, but avoid crashing—let caller handle
+    if "TEAM_NAME" not in df.columns or df["TEAM_NAME"].isna().any():
+        df["TEAM_NAME"] = df["TEAM_ID"].map(id_to_name)
+    if "TEAM_ABBREVIATION" not in df.columns or df["TEAM_ABBREVIATION"].isna().any():
+        df["TEAM_ABBREVIATION"] = df["TEAM_ID"].map(id_to_abbr)
     return df
 
-def fetch_opp_per_game(season: str) -> tuple[pd.DataFrame, str]:
+def select_team_row(df: pd.DataFrame, team_id: int) -> pd.Series:
+    row = df.loc[df["TEAM_ID"] == team_id]
+    if row.empty:
+        raise RuntimeError(f"Selected TEAM_ID {team_id} not found in fetched table.")
+    return row.iloc[0]
+
+def tidy_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Primary: Opponent / PerGame
-    Fallback: Opponent / Totals -> per-game
-    Returns (df, source_label)
+    Keep the core per-game columns first; show others after.
     """
-    # Try Opponent / PerGame
+    preferred = [
+        "TEAM_NAME","TEAM_ABBREVIATION","GP","W","L","W_PCT","MIN","PTS",
+        "FGM","FGA","FG_PCT","FG3M","FG3A","FG3_PCT","FTM","FTA","FT_PCT",
+        "OREB","DREB","REB","AST","TOV","STL","BLK","BLKA","PF","PFD","PLUS_MINUS"
+    ]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    return df[cols]
+
+# -----------------------
+# UI
+# -----------------------
+st.title("NBA Team Basics (Per-Game): Season, Last 5, Last 15")
+
+# Season picker
+season_default = "2025-26"  # update as needed
+season = st.text_input("Season (format e.g. 2025-26)", value=season_default)
+
+teams_df, id_to_name, id_to_abbr = get_team_index()
+
+# Team select (by name)
+team_name = st.selectbox(
+    "Select Team",
+    options=sorted(teams_df["TEAM_NAME"].unique()),
+    index=sorted(teams_df["TEAM_NAME"].unique()).index("Boston Celtics") if "Boston Celtics" in set(teams_df["TEAM_NAME"]) else 0
+)
+team_id = int(teams_df.loc[teams_df["TEAM_NAME"] == team_name, "TEAM_ID"].iloc[0])
+
+st.caption(f"TEAM_ID: {team_id}")
+
+# -----------------------
+# Fetch data blocks
+# -----------------------
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.subheader("Season Averages")
     try:
-        df = LeagueDashTeamStats(
-            season=season,
-            per_mode_detailed="PerGame",
-            measure_type_detailed_defense="Opponent",
-        ).get_data_frames()[0]
-        df = ensure_team_keys(to_num(df))
-        df = derive_2p(df)
-        need = ["TEAM_ID","TEAM_NAME","GP","PTS","FGM","FGA","FG3M","FG3A","FTM","FTA","REB","AST","TOV"]
-        if all(c in df.columns for c in need):
-            return df, "Opponent/PerGame"
-        st.warning("Opponent/PerGame returned but missing core columns — will try fallback.")
+        season_df = fetch_league_dash(season, last_n_games=0)
+        season_df = merge_team_labels(season_df, id_to_name, id_to_abbr)
+        season_df = tidy_columns(season_df)
+        st.dataframe(season_df.loc[season_df["TEAM_ID"] == team_id].reset_index(drop=True), use_container_width=True)
     except Exception as e:
-        st.warning(f"Opponent/PerGame failed: {e}")
+        st.error(f"Failed to load season averages: {e}")
 
-    # Fallback Opponent / Totals → PerGame
+with col2:
+    st.subheader("Last 5 Games")
     try:
-        tot = LeagueDashTeamStats(
-            season=season,
-            per_mode_detailed="Totals",
-            measure_type_detailed_defense="Opponent",
-        ).get_data_frames()[0]
-        tot = ensure_team_keys(to_num(tot))
-        need = ["TEAM_ID","TEAM_NAME","GP","PTS","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB","REB","AST","TOV"]
-        if all(c in tot.columns for c in need):
-            pg = tot.copy()
-            pg["GP"] = pg["GP"].replace({0: np.nan})
-            for c in ["PTS","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB","REB","AST","TOV"]:
-                pg[c] = pg[c] / pg["GP"]
-            pg = derive_2p(pg)
-            return pg, "Opponent/Totals→PerGame"
-        else:
-            st.error("Opponent/Totals present but missing required columns.")
+        last5_df = fetch_league_dash(season, last_n_games=5)
+        last5_df = merge_team_labels(last5_df, id_to_name, id_to_abbr)
+        last5_df = tidy_columns(last5_df)
+        st.dataframe(last5_df.loc[last5_df["TEAM_ID"] == team_id].reset_index(drop=True), use_container_width=True)
     except Exception as e:
-        st.error(f"Opponent/Totals fetch failed: {e}")
+        st.error(f"Failed to load last 5: {e}")
 
-    # Total failure
-    return pd.DataFrame(), "NONE"
-
-# ---------- UI controls ----------
-c1, c2 = st.columns([1,1])
-with c1:
-    season = st.selectbox("Season", SEASONS, index=SEASONS.index(DEFAULT_SEASON))
-with c2:
-    sort_col = st.selectbox("Sort by (allowed stat)", 
-                            ["PTS","FGA","FGM","FG3A","FG3M","FTA","FTM","REB","OREB","DREB","AST","TOV","_2PA","_2PM"],
-                            index=0)
+with col3:
+    st.subheader("Last 15 Games")
+    try:
+        last15_df = fetch_league_dash(season, last_n_games=15)
+        last15_df = merge_team_labels(last15_df, id_to_name, id_to_abbr)
+        last15_df = tidy_columns(last15_df)
+        st.dataframe(last15_df.loc[last15_df["TEAM_ID"] == team_id].reset_index(drop=True), use_container_width=True)
+    except Exception as e:
+        st.error(f"Failed to load last 15: {e}")
 
 st.divider()
-
-# ---------- Fetch + show ----------
-t0 = time.time()
-df, source = fetch_opp_per_game(season)
-elapsed = time.time() - t0
-
-st.subheader("Status")
-if source == "NONE" or df.empty:
-    st.error("🚫 Could not retrieve opponent team table from NBA stats. Check network / headers / rate limits.")
-    st.stop()
-else:
-    st.success(f"✅ Retrieved opponent team table from: **{source}**  |  {len(df)} rows  |  {elapsed:.2f}s")
-
-# Core subset columns to display cleanly
-show_cols = ["TEAM_ID","TEAM_NAME","GP","PTS","FGM","FGA","FG3M","FG3A","_2PM","_2PA","FTM","FTA","OREB","DREB","REB","AST","TOV"]
-present = [c for c in show_cols if c in df.columns]
-missing = [c for c in show_cols if c not in df.columns]
-if missing:
-    st.warning(f"Columns missing from response (FYI): {missing}")
-
-# Sort and show
-if sort_col not in df.columns:
-    st.info(f"Sort column '{sort_col}' not found in data; showing unsorted.")
-    view = df[present].copy()
-else:
-    view = df[present].sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-st.markdown("### Opponent Team Stats — Per Game (Volumes Only)")
-st.dataframe(view, use_container_width=True, hide_index=True)
-
-# Download as CSV to verify schema
-csv = view.to_csv(index=False)
-st.download_button("Download CSV (opponent_per_game.csv)", data=csv, file_name="opponent_per_game.csv", mime="text/csv")
-
-# Raw frame (debug)
-with st.expander("Raw response (debug)"):
-    st.dataframe(df, use_container_width=True)
+st.caption(
+    "Notes: Data from nba_api LeagueDashTeamStats — measure=Base, per_mode=PerGame. "
+    "We only read tables and display the chosen team’s row. Caching (10–30 min) reduces rate limits. "
+    "If an endpoint times out, re-run once."
+)
