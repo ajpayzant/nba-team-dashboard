@@ -404,10 +404,10 @@ def player_dashboard():
 
         col_r1, col_r2 = st.columns([1,1])
         with col_r1:
-            if st.button("🔄 Refresh metrics (safe)"):
+            if st.button("Refresh metrics (safe)"):
                 st.session_state["team_ctx_refresh_key"] = st.session_state.get("team_ctx_refresh_key", 0) + 1
         with col_r2:
-            if st.button("🧹 Hard clear cache"):
+            if st.button("Hard Clear Cache"):
                 st.cache_data.clear()
                 st.session_state["team_ctx_refresh_key"] = st.session_state.get("team_ctx_refresh_key", 0) + 1
 
@@ -1119,7 +1119,7 @@ def team_dashboard():
 # ======================================================================
 # MAIN APP: Tabs
 # ======================================================================
-tab1, tab2 = st.tabs(["🧍 Player Scouting", "🧑‍🤝‍🧑 Team Dashboard"])
+tab1, tab2 = st.tabs(["Player Scouting", "Team Dashboard"])
 
 with tab1:
     player_dashboard()
